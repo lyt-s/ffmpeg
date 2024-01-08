@@ -1574,10 +1574,11 @@ static void video_refresh(void *opaque, double *remaining_time)
     double time;
 
     Frame *sp, *sp2;
-
+    // 外部时钟同步，当主时钟是外部时钟时，才会调用。
     if (!is->paused && get_master_sync_type(is) == AV_SYNC_EXTERNAL_CLOCK && is->realtime)
         check_external_clock_speed(is);
-
+    // 音频波形显示
+    // 需要播放音频的波形图的时候，才会调用
     if (!display_disable && is->show_mode != SHOW_MODE_VIDEO && is->audio_st) {
         time = av_gettime_relative() / 1000000.0;
         if (is->force_refresh || is->last_vis_time + rdftspeed < time) {
@@ -1586,13 +1587,14 @@ static void video_refresh(void *opaque, double *remaining_time)
         }
         *remaining_time = FFMIN(*remaining_time, is->last_vis_time + rdftspeed - time);
     }
-
+    // 播放视频画面
     if (is->video_st) {
 retry:
         if (frame_queue_nb_remaining(&is->pictq) == 0) {
             // nothing to do, no picture to display in the queue
         } else {
             double last_duration, duration, delay;
+            // lastvp 就是窗口正在显示的帧
             Frame *vp, *lastvp;
 
             /* dequeue the picture */
@@ -1603,36 +1605,45 @@ retry:
                 frame_queue_next(&is->pictq);
                 goto retry;
             }
-
+            // 如果进行了快进快退，is->frame_timer 就会重新赋值为系统时间。
             if (lastvp->serial != vp->serial)
                 is->frame_timer = av_gettime_relative() / 1000000.0;
-
+            
+            // 暂停状态
             if (is->paused)
                 goto display;
 
             /* compute nominal last_duration */
+            // 函数是用来获取 窗口正在显示的帧 需要显示多长时间的。
             last_duration = vp_duration(is, lastvp, vp);
+            // 表示当前画面需要播放多久， 函数里面会进行视频同步操作
             delay = compute_target_delay(last_duration, is);
-
+            // 此函数 可以简单理解为获取系统时间，只不过它是从一个任意位置开始的系统时间。
             time= av_gettime_relative()/1000000.0;
             if (time < is->frame_timer + delay) {
                 *remaining_time = FFMIN(is->frame_timer + delay - time, *remaining_time);
                 goto display;
             }
-
+            // 如果不进行快进快退，frame_timer 就会一直累加 delay 
             is->frame_timer += delay;
+            // 如果 当前系统时间 比 当前帧的开始播放时刻 大 0.1 （AV_SYNC_THRESHOLD_MAX），就会重置 frame_timer 为当前系统时间。
             if (delay > 0 && time - is->frame_timer > AV_SYNC_THRESHOLD_MAX)
+                // frame_timer 初始化
+                // 可以理解为 窗口正在显示的帧 的播放时刻，就是说这帧是何时开始播放的，
+                // 从何时开始显示到窗口上的。
                 is->frame_timer = time;
 
             SDL_LockMutex(is->pictq.mutex);
             if (!isnan(vp->pts))
+                // 更新视频时钟
                 update_video_pts(is, vp->pts, vp->serial);
             SDL_UnlockMutex(is->pictq.mutex);
 
             if (frame_queue_nb_remaining(&is->pictq) > 1) {
                 Frame *nextvp = frame_queue_peek_next(&is->pictq);
                 duration = vp_duration(is, vp, nextvp);
-                if(!is->step && (framedrop>0 || (framedrop && get_master_sync_type(is) != AV_SYNC_VIDEO_MASTER)) && time > is->frame_timer + duration){
+                if(!is->step && (framedrop>0 || (framedrop && get_master_sync_type(is) != AV_SYNC_VIDEO_MASTER)) &&
+                 time > is->frame_timer + duration){ // 要播放的帧是否过期
                     is->frame_drops_late++;
                     frame_queue_next(&is->pictq);
                     goto retry;
@@ -1672,7 +1683,8 @@ retry:
                     }
                 }
             }
-
+            // 可以显示要播放的帧了
+            // frame_queue_next() 会偏移读索引，所以导致了下一帧变成了当前帧。
             frame_queue_next(&is->pictq);
             is->force_refresh = 1;
 
@@ -1681,10 +1693,15 @@ retry:
         }
 display:
         /* display picture */
+        // is->force_refresh 这个变量只有是 1 才会 执行 video_display() 
+        // display_disable 默认是 0，可以通过命令行参数改变，主要就是控制窗口不要显示画面，无论是视频帧，还是音频波形都不显示。
+        // is->pictq.rindex_shown 条件，就是为了防止 FrameQueue 一帧数据都没有，就调了 video_display()。
+        // is->show_mode 默认就是 SHOW_MODE_VIDEO 。
         if (!display_disable && is->force_refresh && is->show_mode == SHOW_MODE_VIDEO && is->pictq.rindex_shown)
             video_display(is);
     }
     is->force_refresh = 0;
+    // 日志
     if (show_status) {
         AVBPrint buf;
         static int64_t last_time;
@@ -2136,6 +2153,7 @@ static int video_thread(void *arg)
     AVRational tb = is->video_st->time_base;
     AVRational frame_rate = av_guess_frame_rate(is->ic, is->video_st, NULL);
 
+#if CONFIG_AVFILTER
     // 滤镜容器
     AVFilterGraph *graph = NULL;
     // filt_in 入口滤镜指针，指向滤镜容器的输入,file_out 出口滤镜指针，指向滤镜容器的输出
@@ -2150,6 +2168,7 @@ static int video_thread(void *arg)
     int last_serial = -1;
     // 上一次使用的视频滤镜的索引，ffplay 播放器的命令行是可以指定多个视频滤镜，然后按 w 键切换查看效果的
     int last_vfilter_idx = 0;
+#endif
 
     if (!frame)
         return AVERROR(ENOMEM);
@@ -2180,6 +2199,7 @@ static int video_thread(void *arg)
                 goto the_end;
             }
             graph->nb_threads = filter_nbthreads;
+            // 创建视频滤镜函数
             if ((ret = configure_video_filters(graph, is, vfilters_list ? vfilters_list[is->vfilter_idx] : NULL, frame)) < 0) {
                 SDL_Event event;
                 event.type = FF_QUIT_EVENT;
@@ -2196,7 +2216,7 @@ static int video_thread(void *arg)
             last_vfilter_idx = is->vfilter_idx;
             frame_rate = av_buffersink_get_frame_rate(filt_out);
         }
-
+        // 往入口滤镜发送 AVFrame
         ret = av_buffersrc_add_frame(filt_in, frame);
         if (ret < 0)
             goto the_end;
@@ -2205,7 +2225,7 @@ static int video_thread(void *arg)
             FrameData *fd;
 
             is->frame_last_returned_time = av_gettime_relative() / 1000000.0;
-
+            // 从出口滤镜读取 AVFrame
             ret = av_buffersink_get_frame_flags(filt_out, frame, 0);
             if (ret < 0) {
                 if (ret == AVERROR_EOF)
@@ -2222,6 +2242,7 @@ static int video_thread(void *arg)
             tb = av_buffersink_get_time_base(filt_out);
             duration = (frame_rate.num && frame_rate.den ? av_q2d((AVRational){frame_rate.den, frame_rate.num}) : 0);
             pts = (frame->pts == AV_NOPTS_VALUE) ? NAN : frame->pts * av_q2d(tb);
+            // 此函数可能会阻塞。只是对 frame_queue_peek_writable() 跟 frame_queue_push() 两个函数进行了封装。
             ret = queue_picture(is, frame, pts, duration, fd ? fd->pkt_pos : -1, is->viddec.pkt_serial);
             av_frame_unref(frame);
             if (is->videoq.serial != is->viddec.pkt_serial)
@@ -3281,17 +3302,21 @@ static void toggle_audio_display(VideoState *is)
 }
 
 static void refresh_loop_wait_event(VideoState *is, SDL_Event *event) {
+    // 代表要播放下一帧视频，还需要等待多少秒
     double remaining_time = 0.0;
     SDL_PumpEvents();
+    // 检测是否有键盘事件发生
     while (!SDL_PeepEvents(event, 1, SDL_GETEVENT, SDL_FIRSTEVENT, SDL_LASTEVENT)) {
         if (!cursor_hidden && av_gettime_relative() - cursor_last_shown > CURSOR_HIDE_DELAY) {
             SDL_ShowCursor(0);
             cursor_hidden = 1;
         }
+        // 休眠避免执行太多次数
         if (remaining_time > 0.0)
             av_usleep((int64_t)(remaining_time * 1000000.0));
         remaining_time = REFRESH_RATE;
         if (is->show_mode != SHOW_MODE_NONE && (!is->paused || is->force_refresh))
+        // 无事件，则播放视频流
             video_refresh(is, &remaining_time);
         SDL_PumpEvents();
     }
@@ -3332,6 +3357,8 @@ static void event_loop(VideoState *cur_stream)
 
     for (;;) {
         double x;
+        // refresh_loop_wait_event() 函数检测是否有键盘事件发生，如果有键盘事件发生， 
+        // refresh_loop_wait_event() 就会返回，然后跑到 switch{event.type}{...} 来处理键盘事件。
         refresh_loop_wait_event(cur_stream, &event);
         switch (event.type) {
         case SDL_KEYDOWN:

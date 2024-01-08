@@ -5,7 +5,7 @@
             "name": "cmake - gdb",
             "type": "cppdbg",
             "request": "launch",
-            "program": "/home/lyt/develop/FFmpeg/ffplay_g",
+            "program": "/home/lyt/develop/ffmpeg/ffplay_g",
             "args": [
                 // "/home/ihnfsa/Develop/vec/resources/vec/1.vec"
                 "-i",
