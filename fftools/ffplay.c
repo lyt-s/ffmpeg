@@ -168,16 +168,16 @@ typedef struct Frame {
 } Frame;
 
 typedef struct FrameQueue {
-    Frame queue[FRAME_QUEUE_SIZE];
-    int rindex;
-    int windex;
-    int size;
-    int max_size;
-    int keep_last;
-    int rindex_shown;
-    SDL_mutex *mutex;
-    SDL_cond *cond;
-    PacketQueue *pktq;
+    Frame queue[FRAME_QUEUE_SIZE]; //FRAME_QUEUE_SIZE 等于 16，队列最多缓存 16 个帧
+    int rindex; //当前的读索引位置。
+    int windex; //当前的写索引位置。
+    int size;  //这个字段不是内存大小，而是个数，代表 当前队列已经缓存了多少个 Frame。
+    int max_size;  //队列最多缓存多少个 Frame，max_size可能比FRAME_QUEUE_SIZE小。
+    int keep_last;  //播放之后是否保存上一帧在队列里面不销毁。
+    int rindex_shown;  //配合 keep_last 使用的。
+    SDL_mutex *mutex; //SDL锁，读写队列的时候需要加锁。
+    SDL_cond *cond; //SDL条件变量，用于 解码线程 跟 播放线程 通信
+    PacketQueue *pktq; // 来源， FrameQueue 的数据是从哪一个 PacketQueue 里来的。
 } FrameQueue;
 
 enum {
@@ -202,11 +202,13 @@ typedef struct Decoder {
 } Decoder;
 
 typedef struct VideoState {
+    // Demux解复用线程，读视频文件stream线程，得到AVPacket，并对packet入栈
     SDL_Thread *read_tid;
     const AVInputFormat *iformat;
     int abort_request;
+    //视频播放刷新线程，定时播放下一帧
     int force_refresh;
-    int paused;
+    int paused;  //控制视频暂停或播放标志位
     int last_paused;
     int queue_attachments_req;
     int seek_req;
@@ -239,8 +241,9 @@ typedef struct VideoState {
     double audio_diff_avg_coef;
     double audio_diff_threshold;
     int audio_diff_avg_count;
-    AVStream *audio_st;
-    PacketQueue audioq;
+
+    AVStream *audio_st;  //音频流
+    PacketQueue audioq;  //音频packet队列
     int audio_hw_buf_size;
     uint8_t *audio_buf;
     uint8_t *audio_buf1;
@@ -275,15 +278,15 @@ typedef struct VideoState {
     SDL_Texture *vid_texture;
 
     int subtitle_stream;
-    AVStream *subtitle_st;
-    PacketQueue subtitleq;
+    AVStream *subtitle_st; // 字幕流
+    PacketQueue subtitleq; // 字幕packet流
 
     double frame_timer;
     double frame_last_returned_time;
     double frame_last_filter_delay;
     int video_stream;
-    AVStream *video_st;
-    PacketQueue videoq;
+    AVStream *video_st; // 视频流
+    PacketQueue videoq; // 视频packet队列
     double max_frame_duration;      // maximum duration of a frame - above this, we consider the jump a timestamp discontinuity
     struct SwsContext *sub_convert_ctx;
     int eof;
@@ -1009,8 +1012,9 @@ static void video_image_display(VideoState *is)
                 sp = NULL;
         }
     }
-
+     // 计算图像的显示区域
     calculate_display_rect(&rect, is->xleft, is->ytop, is->width, is->height, vp->width, vp->height, vp->sar);
+    
     set_sdl_yuv_conversion_mode(vp->frame);
 
     if (!vp->uploaded) {
@@ -1482,14 +1486,18 @@ static void stream_seek(VideoState *is, int64_t pos, int64_t rel, int by_bytes)
 static void stream_toggle_pause(VideoState *is)
 {
     if (is->paused) {
+        //由于frame_timer记下来视频从开始播放到当前帧播放的时间，
         is->frame_timer += av_gettime_relative() / 1000000.0 - is->vidclk.last_updated;
         if (is->read_pause_return != AVERROR(ENOSYS)) {
             is->vidclk.paused = 0;
+            
         }
         set_clock(&is->vidclk, get_clock(&is->vidclk), is->vidclk.serial);
     }
     set_clock(&is->extclk, get_clock(&is->extclk), is->extclk.serial);
+    //paused取反，paused标志位也会控制到图像帧的展示，按一次空格键实现暂停，再按一次就实现播放了。
     is->paused = is->audclk.paused = is->vidclk.paused = is->extclk.paused = !is->paused;
+    // paused标志位控制着视频是否播放，当需要继续播放的时候，一定要重新更新当前所需要播放帧的pts时间，因为这里面要加上已经暂停的时间。
 }
 
 static void toggle_pause(VideoState *is)
@@ -1521,20 +1529,24 @@ static void step_to_next_frame(VideoState *is)
 static double compute_target_delay(double delay, VideoState *is)
 {
     double sync_threshold, diff = 0;
-
+    // 因为音频是采样数据，有固定的采样周期并且依赖于主系统时钟，要调整音频的延时播放较难控制。
+    // 所以实际场合中视频同步音频相比音频同步视频实现起来更容易
     /* update delay to follow master synchronisation source */
     if (get_master_sync_type(is) != AV_SYNC_VIDEO_MASTER) {
         /* if video is slave, we try to correct big delays by
            duplicating or deleting a frame */
+        //获取当前视频帧播放的时间，与系统主时钟时间相减得到差值
         diff = get_clock(&is->vidclk) - get_master_clock(is);
 
         /* skip or repeat frame. We take into account the
            delay to compute the threshold. I still don't know
            if it is the best guess */
         sync_threshold = FFMAX(AV_SYNC_THRESHOLD_MIN, FFMIN(AV_SYNC_THRESHOLD_MAX, delay));
+        //假如当前帧的播放时间，也就是pts，滞后于主时钟
         if (!isnan(diff) && fabs(diff) < is->max_frame_duration) {
             if (diff <= -sync_threshold)
                 delay = FFMAX(0, delay + diff);
+            //假如当前帧的播放时间，也就是pts，超前于主时钟，那就需要加大延时
             else if (diff >= sync_threshold && delay > AV_SYNC_FRAMEDUP_THRESHOLD)
                 delay = delay + diff;
             else if (diff >= sync_threshold)
@@ -1620,6 +1632,8 @@ retry:
             delay = compute_target_delay(last_duration, is);
             // 此函数 可以简单理解为获取系统时间，只不过它是从一个任意位置开始的系统时间。
             time= av_gettime_relative()/1000000.0;
+
+            //假如当前时间小于frame_timer + delay，也就是这帧改显示的时间超前，还没到，就直接返回
             if (time < is->frame_timer + delay) {
                 *remaining_time = FFMIN(is->frame_timer + delay - time, *remaining_time);
                 goto display;
@@ -1636,6 +1650,7 @@ retry:
             SDL_LockMutex(is->pictq.mutex);
             if (!isnan(vp->pts))
                 // 更新视频时钟
+                // 更新is当中当前帧的pts，比如video_current_pts、video_current_pos 等变量
                 update_video_pts(is, vp->pts, vp->serial);
             SDL_UnlockMutex(is->pictq.mutex);
 
