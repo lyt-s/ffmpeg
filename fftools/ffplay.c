@@ -1373,12 +1373,16 @@ static void video_display(VideoState *is)
 
 static double get_clock(Clock *c)
 {
+    // 如果时钟的播放序列与待解码包队列的序列不一致了，返回NAN，肯定就是不同步或者需要丢帧了
     if (*c->queue_serial != c->serial)
         return NAN;
     if (c->paused) {
+        // 暂停状态则返回原来的pts
         return c->pts;
     } else {
         double time = av_gettime_relative() / 1000000.0;
+        // speed可以先忽略播放速度控制
+        // 如果是1倍播放速度，c->pts_drift + time
         return c->pts_drift + time - (time - c->last_updated) * (1.0 - c->speed);
     }
 }
@@ -1529,27 +1533,32 @@ static void step_to_next_frame(VideoState *is)
 static double compute_target_delay(double delay, VideoState *is)
 {
     double sync_threshold, diff = 0;
+    // 如果是音频时钟为主时钟，就会跑进去 if 里面的逻辑。
     // 因为音频是采样数据，有固定的采样周期并且依赖于主系统时钟，要调整音频的延时播放较难控制。
     // 所以实际场合中视频同步音频相比音频同步视频实现起来更容易
     /* update delay to follow master synchronisation source */
     if (get_master_sync_type(is) != AV_SYNC_VIDEO_MASTER) {
         /* if video is slave, we try to correct big delays by
            duplicating or deleting a frame */
-        //获取当前视频帧播放的时间，与系统主时钟时间相减得到差值
+        // 音频时钟和视频时钟的差距
+        // 如果是以音频时钟为基准，那么 get_master_clock 拿到的就是音频时钟的pts
+        // 获取当前视频帧播放的时间，与系统主时钟时间相减得到差值
         diff = get_clock(&is->vidclk) - get_master_clock(is);
 
         /* skip or repeat frame. We take into account the
            delay to compute the threshold. I still don't know
            if it is the best guess */
         sync_threshold = FFMAX(AV_SYNC_THRESHOLD_MIN, FFMIN(AV_SYNC_THRESHOLD_MAX, delay));
-        //假如当前帧的播放时间，也就是pts，滞后于主时钟
+        //假如当前帧的播放时间，也就是pts，滞后于主时钟，需要做同步调整
         if (!isnan(diff) && fabs(diff) < is->max_frame_duration) {
             if (diff <= -sync_threshold)
+                // 视频落后了，并且超过了同步阈值
                 delay = FFMAX(0, delay + diff);
-            //假如当前帧的播放时间，也就是pts，超前于主时钟，那就需要加大延时
+            //假如当前帧的播放时间，也就是pts，超前于主时钟，那就需要加大延时。
             else if (diff >= sync_threshold && delay > AV_SYNC_FRAMEDUP_THRESHOLD)
                 delay = delay + diff;
             else if (diff >= sync_threshold)
+                // 视频超前了，且超过了同步阈值
                 delay = 2 * delay;
         }
     }
@@ -1586,7 +1595,7 @@ static void video_refresh(void *opaque, double *remaining_time)
     double time;
 
     Frame *sp, *sp2;
-    // 外部时钟同步，当主时钟是外部时钟时，才会调用。
+    // 外部时钟同步，当主时钟是外部时钟时，才会调用。 忽略
     if (!is->paused && get_master_sync_type(is) == AV_SYNC_EXTERNAL_CLOCK && is->realtime)
         check_external_clock_speed(is);
     // 音频波形显示
@@ -1601,7 +1610,8 @@ static void video_refresh(void *opaque, double *remaining_time)
     }
     // 播放视频画面
     if (is->video_st) {
-retry:
+retry:  
+        // 没有可读的帧
         if (frame_queue_nb_remaining(&is->pictq) == 0) {
             // nothing to do, no picture to display in the queue
         } else {
@@ -1610,34 +1620,42 @@ retry:
             Frame *vp, *lastvp;
 
             /* dequeue the picture */
+            // 正在显示的帧
             lastvp = frame_queue_peek_last(&is->pictq);
+            // 将要显示的帧
             vp = frame_queue_peek(&is->pictq);
 
             if (vp->serial != is->videoq.serial) {
+                // 不在同一个播放序列了，丢弃
                 frame_queue_next(&is->pictq);
                 goto retry;
             }
             // 如果进行了快进快退，is->frame_timer 就会重新赋值为系统时间。
             if (lastvp->serial != vp->serial)
+                // 不在同一个播放序列，更改最新帧的时间
                 is->frame_timer = av_gettime_relative() / 1000000.0;
             
             // 暂停状态
             if (is->paused)
+            // 如果是暂停状态，则更新显示
                 goto display;
 
             /* compute nominal last_duration */
-            // 函数是用来获取 窗口正在显示的帧 需要显示多长时间的。
+            // 函数是用来获取 窗口正在显示的帧 需要显示多长时间的。计算上一帧该帧需要显示多久，理想播放时长
             last_duration = vp_duration(is, lastvp, vp);
-            // 表示当前画面需要播放多久， 函数里面会进行视频同步操作
+            // 表示当前画面需要播放多久， 函数里面会进行视频同步操作，上一帧经过校正后实际需要显示多长
             delay = compute_target_delay(last_duration, is);
             // 此函数 可以简单理解为获取系统时间，只不过它是从一个任意位置开始的系统时间。
             time= av_gettime_relative()/1000000.0;
 
             //假如当前时间小于frame_timer + delay，也就是这帧改显示的时间超前，还没到，就直接返回
             if (time < is->frame_timer + delay) {
+                // 还没达到下一帧的显示时间，继续显示上一帧
                 *remaining_time = FFMIN(is->frame_timer + delay - time, *remaining_time);
                 goto display;
             }
+            // 显示下一帧了
+            // 更新播放时间
             // 如果不进行快进快退，frame_timer 就会一直累加 delay 
             is->frame_timer += delay;
             // 如果 当前系统时间 比 当前帧的开始播放时刻 大 0.1 （AV_SYNC_THRESHOLD_MAX），就会重置 frame_timer 为当前系统时间。
@@ -1654,6 +1672,7 @@ retry:
                 update_video_pts(is, vp->pts, vp->serial);
             SDL_UnlockMutex(is->pictq.mutex);
 
+            // 帧队列中是否有可以播放的帧
             if (frame_queue_nb_remaining(&is->pictq) > 1) {
                 Frame *nextvp = frame_queue_peek_next(&is->pictq);
                 duration = vp_duration(is, vp, nextvp);
@@ -2327,7 +2346,9 @@ static void update_sample_display(VideoState *is, short *samples, int samples_si
 }
 
 /* return the wanted number of samples to get better sync if sync_type is video
- * or external master clock */
+ * or external master clock 
+ * 如果同步类型为视频或外部主时钟，则返回所需的采样数来更好的同步。
+ */
 static int synchronize_audio(VideoState *is, int nb_samples)
 {
     int wanted_nb_samples = nb_samples;
