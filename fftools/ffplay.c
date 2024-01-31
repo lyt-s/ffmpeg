@@ -2357,16 +2357,22 @@ static int synchronize_audio(VideoState *is, int nb_samples)
     if (get_master_sync_type(is) != AV_SYNC_AUDIO_MASTER) {
         double diff, avg_diff;
         int min_nb_samples, max_nb_samples;
-
+        // 计算音频时间差
         diff = get_clock(&is->audclk) - get_master_clock(is);
-
+        // 如果不同步程度超过10（diff > 10s)，直接摆烂，不管了
+        // 音频同步算法也是把不同步的程度控制在阈值（audio_diff_threshold）内，如果不超过阈值 就不进行同步了。
         if (!isnan(diff) && fabs(diff) < AV_NOSYNC_THRESHOLD) {
+            // 20次音视频差异的加权总和
+            // audio_diff_avg_coef 公比 Q
+            // 其实这是一种降权的操作，主要作用是让前面的差异权重越来越小，后面的差异权重越来越大。我把 diff 分为 3 次差异讲解。
             is->audio_diff_cum = diff + is->audio_diff_avg_coef * is->audio_diff_cum;
+            // 不同步20次，才进行调整样本数
             if (is->audio_diff_avg_count < AUDIO_DIFF_AVG_NB) {
                 /* not enough measures to have a correct estimate */
                 is->audio_diff_avg_count++;
             } else {
                 /* estimate the A-V difference */
+                // avg_diff 就是20 次以上的音视频差异的加权平均数。
                 avg_diff = is->audio_diff_cum * (1.0 - is->audio_diff_avg_coef);
 
                 if (fabs(avg_diff) >= is->audio_diff_threshold) {
